@@ -33,6 +33,7 @@ pub struct FlamelensWidgetState {
     frame_width: u16,
     render_time: Duration,
     cursor_position: Option<(u16, u16)>,
+    log_visible_lines: usize,
 }
 
 pub struct ZoomState {
@@ -101,10 +102,20 @@ impl<'a> FlamelensWidget<'a> {
             )
             .alignment(Alignment::Center);
 
+        let log_panel_height = if self.app.show_log_panel && self.app.has_log_channel {
+            ((area.height as f32 * 0.25) as u16).clamp(6, 15)
+        } else {
+            0
+        };
+
         let mut constraints = vec![
             Constraint::Length(header_line_count_with_borders),
             Constraint::Fill(1),
         ];
+
+        if log_panel_height > 0 {
+            constraints.push(Constraint::Length(log_panel_height));
+        }
 
         // Constraints for context bars
         let context_bar_index_start = constraints.len();
@@ -148,6 +159,13 @@ impl<'a> FlamelensWidget<'a> {
         };
         let flamegraph_render_time = tic.elapsed();
 
+        if log_panel_height > 0 {
+            self.render_log_panel(layout[2], buf);
+            let border_overhead = 1;
+            state.log_visible_lines =
+                layout[2].height.saturating_sub(border_overhead) as usize;
+        }
+
         // Context bars
         for (i, bar) in context_bars.iter().enumerate() {
             bar.render(layout[context_bar_index_start + i], buf);
@@ -190,6 +208,18 @@ impl<'a> FlamelensWidget<'a> {
             help_tags.add("1", "sort by total");
             help_tags.add("2", "sort by own");
             help_tags.add("/", "filter");
+        }
+        if self.app.has_log_channel {
+            if self.app.show_log_panel {
+                help_tags.add("L", "hide logs");
+                help_tags.add("C-j/k", "scroll logs");
+                help_tags.add("C-f", "log search");
+                if self.app.log_search_pattern.is_some() {
+                    help_tags.add("C-n/p", "next/prev match");
+                }
+            } else {
+                help_tags.add("L", "show logs");
+            }
         }
         help_tags
     }
@@ -237,6 +267,75 @@ impl<'a> FlamelensWidget<'a> {
             .with_selected(self.app.flamegraph_state().table_state.selected)
             .with_offset(self.app.flamegraph_state().table_state.offset);
         StatefulWidget::render(ordered_stacks_table, area, buf, &mut table_state);
+    }
+
+    fn render_log_panel(&self, area: Rect, buf: &mut Buffer) {
+        let offset = self.app.log_scroll_offset;
+        let title = if let Some(text) = &self.app.log_search_text {
+            if offset > 0 {
+                format!(" Logs [+{}] [search: {}] ", offset, text)
+            } else {
+                format!(" Logs [search: {}] ", text)
+            }
+        } else if offset > 0 {
+            format!(" Logs [+{}] ", offset)
+        } else {
+            " Logs ".to_string()
+        };
+        let block = Block::new()
+            .borders(Borders::TOP)
+            .title(title)
+            .title_style(Style::default().add_modifier(Modifier::BOLD).yellow())
+            .title_position(Position::Top);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let visible_lines = inner.height as usize;
+        let messages = &self.app.log_messages;
+        let end = messages.len().saturating_sub(offset);
+        let start = end.saturating_sub(visible_lines);
+        let re = self.app.log_search_pattern.as_ref();
+        let current_match = self.app.log_current_match_line;
+        let lines: Vec<Line> = messages
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+            .map(|(idx, msg)| {
+                let color = if msg.starts_with("ERROR") {
+                    Color::Red
+                } else if msg.starts_with("WARN") {
+                    Color::Yellow
+                } else if msg.starts_with("INFO") {
+                    Color::Green
+                } else if msg.starts_with("DEBUG") {
+                    Color::Cyan
+                } else if msg.starts_with("TRACE") {
+                    Color::DarkGray
+                } else {
+                    Color::Gray
+                };
+                let is_current_match = current_match == Some(idx);
+                let style = Style::default().fg(color);
+                let line = if let Some(re) = re {
+                    if re.is_match(msg) {
+                        Line::from(self.get_highlighted_spans(msg.as_str(), re, style))
+                    } else {
+                        Line::from(Span::styled(msg.as_str(), style))
+                    }
+                } else {
+                    Line::from(Span::styled(msg.as_str(), style))
+                };
+                if is_current_match {
+                    line.style(Style::default().bg(Color::Rgb(80, 80, 40)))
+                } else {
+                    line
+                }
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        paragraph.render(inner, buf);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -554,7 +653,9 @@ impl<'a> FlamelensWidget<'a> {
     }
 
     fn get_status_text(&self, width: u16) -> Vec<(&'static str, Line<'_>)> {
-        if self.app.input_buffer.is_some() {
+        if self.app.log_input_buffer.is_some() {
+            self.get_status_text_log_buffer()
+        } else if self.app.input_buffer.is_some() {
             self.get_status_text_buffer()
         } else {
             self.get_status_text_command(width)
@@ -567,13 +668,36 @@ impl<'a> FlamelensWidget<'a> {
         vec![("Search", Line::from(status_text))]
     }
 
+    fn get_status_text_log_buffer(&self) -> Vec<(&'static str, Line<'_>)> {
+        let input_buffer = self.app.log_input_buffer.as_ref().unwrap();
+        let value = input_buffer.buffer.value();
+        let cursor = input_buffer.buffer.cursor();
+        let before = &value[..cursor];
+        let after = &value[cursor..];
+        let cursor_char = if after.is_empty() { " " } else { &after[..1] };
+        let rest = if after.is_empty() { "" } else { &after[1..] };
+        let line = Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                cursor_char,
+                Style::default().bg(Color::Gray).fg(Color::Black),
+            ),
+            Span::raw(rest),
+        ]);
+        vec![("Log Search", line)]
+    }
+
     fn get_cursor_position(&self, status_area: Rect) -> Option<(u16, u16)> {
-        self.app.input_buffer.as_ref().map(|input_buffer| {
-            (
-                (input_buffer.buffer.cursor() + SEARCH_PREFIX.len()) as u16,
-                status_area.bottom().saturating_sub(1),
-            )
-        })
+        self.app
+            .log_input_buffer
+            .as_ref()
+            .or(self.app.input_buffer.as_ref())
+            .map(|input_buffer| {
+                (
+                    (input_buffer.buffer.cursor() + SEARCH_PREFIX.len()) as u16,
+                    status_area.bottom().saturating_sub(1),
+                )
+            })
     }
 
     fn get_status_text_command(&self, width: u16) -> Vec<(&'static str, Line<'_>)> {
@@ -735,7 +859,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     app.flamegraph_view
         .set_frame_width(flamelens_state.frame_width);
     app.add_elapsed("render", flamelens_state.render_time);
-    if let Some(input_buffer) = &mut app.input_buffer {
+    if flamelens_state.log_visible_lines > 0 {
+        app.log_visible_lines = flamelens_state.log_visible_lines;
+    }
+    if let Some(input_buffer) = &mut app.log_input_buffer {
+        input_buffer.cursor = flamelens_state.cursor_position;
+    } else if let Some(input_buffer) = &mut app.input_buffer {
         input_buffer.cursor = flamelens_state.cursor_position;
     }
 }

@@ -153,6 +153,90 @@ pub fn run_from_live_stream(rx: std::sync::mpsc::Receiver<String>, title: &str) 
     Ok(())
 }
 
+pub fn run_from_live_stream_with_logs(
+    rx: std::sync::mpsc::Receiver<String>,
+    log_rx: crossbeam_channel::Receiver<String>,
+    title: &str,
+    log_capacity: Option<usize>,
+) -> AppResult<()> {
+    let flamegraph = FlameGraph::from_string(String::new(), true);
+    let mut app = App::with_flamegraph(title, flamegraph);
+    app.has_log_channel = true;
+    app.show_log_panel = true;
+    app.set_log_max_capacity(log_capacity.unwrap_or(1000));
+
+    let (parse_tx, parse_rx) = std::sync::mpsc::channel::<String>();
+
+    let next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>> = Arc::new(Mutex::new(None));
+    let next_fg_clone = next_flamegraph.clone();
+
+    std::thread::spawn(move || {
+        while let Ok(combined) = parse_rx.recv() {
+            let mut latest = combined;
+            while let Ok(newer) = parse_rx.try_recv() {
+                latest = newer;
+            }
+            let tic = std::time::Instant::now();
+            let flamegraph = FlameGraph::from_string(latest, true);
+            let parsed = ParsedFlameGraph {
+                flamegraph,
+                elapsed: tic.elapsed(),
+            };
+            *next_fg_clone.lock().unwrap() = Some(parsed);
+        }
+    });
+
+    let pending_logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let pending_logs_clone = pending_logs.clone();
+
+    std::thread::spawn(move || {
+        while let Ok(msg) = log_rx.recv() {
+            pending_logs_clone.lock().unwrap().push(msg);
+        }
+    });
+
+    let mut accumulated_stacks: Vec<String> = Vec::new();
+
+    let backend = CrosstermBackend::new(io::stderr());
+    let terminal = Terminal::new(backend)?;
+    let events = EventHandler::new(250);
+    let mut tui = tui::Tui::new(terminal, events);
+    tui.init()?;
+
+    while app.running {
+        let mut has_new_data = false;
+        while let Ok(new_data) = rx.try_recv() {
+            accumulated_stacks = merge_collapsed_stacks(&accumulated_stacks, &new_data);
+            has_new_data = true;
+        }
+
+        if has_new_data {
+            let combined = accumulated_stacks.join("\n");
+            let _ = parse_tx.send(combined);
+        }
+
+        if let Some(parsed) = next_flamegraph.lock().unwrap().take() {
+            app.flamegraph_view.replace_flamegraph(parsed.flamegraph);
+        }
+
+        let drained: Vec<String> = pending_logs.lock().unwrap().drain(..).collect();
+        for msg in drained {
+            app.push_log_message(msg);
+        }
+
+        tui.draw(&mut app)?;
+        match tui.events.next()? {
+            Event::Tick => app.tick(),
+            Event::Key(key_event) => handle_key_events(key_event, &mut app)?,
+            Event::Mouse(_) => {}
+            Event::Resize(_, _) => {}
+        }
+    }
+
+    tui.exit()?;
+    Ok(())
+}
+
 // Helper: shared TUI loop logic for static mode
 fn run_tui_loop(app: &mut App) -> AppResult<()> {
     let backend = CrosstermBackend::new(io::stderr());

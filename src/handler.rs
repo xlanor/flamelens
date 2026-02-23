@@ -9,6 +9,9 @@ use tui_input::backend::crossterm::EventHandler;
 
 /// Handles the key events and updates the state of [`App`].
 pub fn handle_key_events(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
+    if app.log_input_buffer.is_some() {
+        return handle_log_input_buffer(key_event, app);
+    }
     if app.input_buffer.is_none() {
         let tic = Instant::now();
         handle_command(key_event, app)?;
@@ -62,6 +65,38 @@ pub fn handle_command_generic(key_event: KeyEvent, app: &mut App) -> AppResult<b
         }
         KeyCode::Char('?') => {
             app.toggle_debug();
+        }
+        KeyCode::Char('L') => {
+            app.toggle_log_panel();
+        }
+        KeyCode::Char('k') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_scroll_up(1);
+        }
+        KeyCode::Char('j') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_scroll_down(1);
+        }
+        KeyCode::Char('u') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_scroll_up(10);
+        }
+        KeyCode::Char('d') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_scroll_down(10);
+        }
+        KeyCode::Char('g') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_scroll_to_bottom();
+        }
+        KeyCode::Char('f') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_input_buffer = Some(InputBuffer {
+                buffer: tui_input::Input::new(
+                    app.log_search_text.clone().unwrap_or_default(),
+                ),
+                cursor: None,
+            });
+        }
+        KeyCode::Char('n') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_next_match();
+        }
+        KeyCode::Char('p') if key_event.modifiers == KeyModifiers::CONTROL && app.show_log_panel => {
+            app.log_prev_match();
         }
         _ => {
             key_handled = false;
@@ -170,6 +205,32 @@ pub fn handle_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> 
                     app.set_manual_search_pattern(re_pattern.as_str(), true);
                 }
                 app.input_buffer = None;
+            }
+            _ => {
+                input.buffer.handle_event(&Event::Key(key_event));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_log_input_buffer(key_event: KeyEvent, app: &mut App) -> AppResult<()> {
+    if let Some(input) = app.log_input_buffer.as_mut() {
+        match key_event.code {
+            KeyCode::Esc => {
+                app.log_input_buffer = None;
+            }
+            KeyCode::Enter => {
+                if input.buffer.value().is_empty() {
+                    app.clear_log_search();
+                } else {
+                    let pattern = input.buffer.value().to_string();
+                    app.set_log_search_pattern(&pattern);
+                }
+                app.log_input_buffer = None;
+            }
+            KeyCode::Char('u') if key_event.modifiers == KeyModifiers::CONTROL => {
+                input.buffer = tui_input::Input::new("".to_string());
             }
             _ => {
                 input.buffer.handle_event(&Event::Key(key_event));

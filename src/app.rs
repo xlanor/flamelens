@@ -6,6 +6,7 @@ use crate::view::FlameGraphView;
 #[cfg(feature = "python")]
 use remoteprocess;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::error;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "python")]
@@ -54,6 +55,17 @@ pub struct App {
     next_flamegraph: Arc<Mutex<Option<ParsedFlameGraph>>>,
     #[cfg(feature = "python")]
     sampler_state: Option<Arc<Mutex<SamplerState>>>,
+    pub log_messages: VecDeque<String>,
+    pub show_log_panel: bool,
+    pub has_log_channel: bool,
+    pub log_scroll_offset: usize,
+    pub log_auto_scroll: bool,
+    pub log_search_pattern: Option<regex::Regex>,
+    pub log_search_text: Option<String>,
+    pub log_input_buffer: Option<InputBuffer>,
+    pub log_max_capacity: usize,
+    pub log_current_match_line: Option<usize>,
+    pub log_visible_lines: usize,
 }
 
 impl App {
@@ -70,6 +82,17 @@ impl App {
             next_flamegraph: Arc::new(Mutex::new(None)),
             #[cfg(feature = "python")]
             sampler_state: None,
+            log_messages: VecDeque::new(),
+            show_log_panel: false,
+            has_log_channel: false,
+            log_scroll_offset: 0,
+            log_auto_scroll: true,
+            log_search_pattern: None,
+            log_search_text: None,
+            log_input_buffer: None,
+            log_max_capacity: 1000,
+            log_current_match_line: None,
+            log_visible_lines: 8,
         }
     }
 
@@ -139,6 +162,17 @@ impl App {
             transient_message: None,
             debug: false,
             sampler_state: Some(sampler_state),
+            log_messages: VecDeque::new(),
+            show_log_panel: false,
+            has_log_channel: false,
+            log_scroll_offset: 0,
+            log_auto_scroll: true,
+            log_search_pattern: None,
+            log_search_text: None,
+            log_input_buffer: None,
+            log_max_capacity: 1000,
+            log_current_match_line: None,
+            log_visible_lines: 8,
         }
     }
 
@@ -235,5 +269,125 @@ impl App {
 
     pub fn toggle_debug(&mut self) {
         self.debug = !self.debug;
+    }
+
+    pub fn push_log_message(&mut self, msg: String) {
+        self.log_messages.push_back(msg);
+        if !self.log_auto_scroll {
+            self.log_scroll_offset += 1;
+        }
+        if self.log_messages.len() > self.log_max_capacity {
+            self.log_messages.pop_front();
+            if self.log_scroll_offset > 0 {
+                self.log_scroll_offset -= 1;
+            }
+        }
+    }
+
+    pub fn toggle_log_panel(&mut self) {
+        if self.has_log_channel {
+            self.show_log_panel = !self.show_log_panel;
+        }
+    }
+
+    pub fn log_scroll_up(&mut self, lines: usize) {
+        self.log_scroll_offset = self
+            .log_scroll_offset
+            .saturating_add(lines)
+            .min(self.log_messages.len().saturating_sub(self.log_visible_lines));
+        self.log_auto_scroll = false;
+    }
+
+    pub fn log_scroll_down(&mut self, lines: usize) {
+        self.log_scroll_offset = self.log_scroll_offset.saturating_sub(lines);
+        if self.log_scroll_offset == 0 {
+            self.log_auto_scroll = true;
+        }
+    }
+
+    pub fn log_scroll_to_bottom(&mut self) {
+        self.log_scroll_offset = 0;
+        self.log_auto_scroll = true;
+    }
+
+    pub fn set_log_search_pattern(&mut self, pattern: &str) {
+        match regex::Regex::new(pattern) {
+            Ok(re) => {
+                let len = self.log_messages.len();
+                let initial_match = (0..len)
+                    .rev()
+                    .find(|&i| re.is_match(&self.log_messages[i]));
+                self.log_search_pattern = Some(re);
+                self.log_search_text = Some(pattern.to_string());
+                self.log_current_match_line = initial_match;
+                if let Some(i) = initial_match {
+                    self.scroll_to_log_line(i);
+                }
+            }
+            Err(_) => {
+                self.set_transient_message(&format!("Invalid regex: {}", pattern));
+            }
+        }
+    }
+
+    pub fn clear_log_search(&mut self) {
+        self.log_search_pattern = None;
+        self.log_search_text = None;
+        self.log_current_match_line = None;
+    }
+
+    pub fn log_next_match(&mut self) {
+        if let Some(re) = &self.log_search_pattern {
+            let len = self.log_messages.len();
+            if len == 0 {
+                return;
+            }
+            let start = self.log_current_match_line.map_or(0, |i| i + 1);
+            for i in start..len {
+                if re.is_match(&self.log_messages[i]) {
+                    self.log_current_match_line = Some(i);
+                    self.scroll_to_log_line(i);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn log_prev_match(&mut self) {
+        if let Some(re) = &self.log_search_pattern {
+            let len = self.log_messages.len();
+            if len == 0 {
+                return;
+            }
+            let start = self
+                .log_current_match_line
+                .unwrap_or(len)
+                .saturating_sub(1);
+            for i in (0..=start).rev() {
+                if re.is_match(&self.log_messages[i]) {
+                    self.log_current_match_line = Some(i);
+                    self.scroll_to_log_line(i);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn scroll_to_log_line(&mut self, line: usize) {
+        let len = self.log_messages.len();
+        let end = len.saturating_sub(self.log_scroll_offset);
+        let start = end.saturating_sub(self.log_visible_lines);
+        if line >= start && line < end {
+            return;
+        }
+        let half = self.log_visible_lines / 2;
+        self.log_scroll_offset = len
+            .saturating_sub(line + half + 1)
+            .min(len.saturating_sub(self.log_visible_lines));
+        self.log_auto_scroll = self.log_scroll_offset == 0;
+    }
+
+    pub fn set_log_max_capacity(&mut self, capacity: usize) {
+        self.log_max_capacity = capacity;
     }
 }

@@ -53,7 +53,11 @@ impl<B: Backend> Tui<B> {
     pub fn draw(&mut self, app: &mut App) -> AppResult<()> {
         self.terminal.draw(|frame| {
             ui::render(app, frame);
-            if let Some(input_buffer) = &app.input_buffer {
+            let active_buffer = app
+                .log_input_buffer
+                .as_ref()
+                .or(app.input_buffer.as_ref());
+            if let Some(input_buffer) = active_buffer {
                 if let Some(cursor) = input_buffer.cursor {
                     frame.set_cursor_position((cursor.0, cursor.1));
                 }
